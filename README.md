@@ -2,6 +2,10 @@
 ![GitHub Workflow Status](https://img.shields.io/github/workflow/status/numero33/dataloaden/Test)
 [![Go Report Card](https://goreportcard.com/badge/github.com/numero33/dataloaden)](https://goreportcard.com/report/github.com/numero33/dataloaden)
 [![Coverage Status](https://coveralls.io/repos/github/numero33/dataloaden/badge.svg)](https://coveralls.io/github/numero33/dataloaden)
+![GitHub go.mod Go version](https://img.shields.io/github/go-mod/go-version/numero33/dataloaden)
+![GitHub top language](https://img.shields.io/github/languages/top/numero33/dataloaden)
+![GitHub code size in bytes](https://img.shields.io/github/languages/code-size/numero33/dataloaden)
+![GitHub](https://img.shields.io/github/license/numero33/dataloaden)
 
 > This is an implementation of [Facebook's DataLoader](https://github.com/facebook/dataloader) in **Golang 1.18**.
 
