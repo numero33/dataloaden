@@ -166,6 +166,11 @@ func TestLoader(t *testing.T) {
 		require.Len(t, fetches, 4)
 	})
 
+	t.Run("clear already cleared one", func(t *testing.T) {
+		dl.Clear("U99")
+		dl.Clear("U99")
+	})
+
 	t.Run("load all thunk", func(t *testing.T) {
 		thunk1 := dl.LoadAllThunk([]string{"U5", "U6"})
 		thunk2 := dl.LoadAllThunk([]string{"U6", "E6"})
