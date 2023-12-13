@@ -6,43 +6,56 @@ import (
 	"time"
 )
 
-// LoaderConfig captures the config to create a new Loader
-type LoaderConfig[K comparable, V any] struct {
-	// Fetch is a method that provides the data for the loader
-	Fetch func(keys []K) ([]V, []error)
+// BatchFunc is a function, which when given a slice of keys (string), returns a slice of `results`.
+// It's important that the length of the input keys matches the length of the output results.
+//
+// The keys passed to this function are guaranteed to be unique
+type BatchFunc[K comparable, V any] func(context.Context, []K) ([]V, []error)
 
-	// Wait is how long wait before sending a batch
-	Wait time.Duration
+// Option allows for configuration of Loader fields.
+type Option[K comparable, V any] func(*Loader[K, V])
 
-	// MaxBatch will limit the maximum number of keys to send in one batch, 0 = not limit
-	MaxBatch int
-
-	// Cache is the cache to use, if nil a new InMemoryCache will be created
-	Cache Cache[K, V]
-
-	// Context to use for all requests, if nil a new context.Background() will be used
-	Context context.Context
+// WithCache sets the BatchedLoader cache. Defaults to InMemoryCache if a Cache is not set.
+func WithCache[K comparable, V any](c Cache[K, V]) Option[K, V] {
+	return func(l *Loader[K, V]) {
+		l.cache = c
+	}
 }
 
-// NewLoader creates a new Loader given a fetch, wait, and maxBatch
-func NewLoader[K comparable, V any](config LoaderConfig[K, V]) *Loader[K, V] {
-	cache := config.Cache
-	if cache == nil {
-		cache = NewInMemoryCache[K, V]()
+// WithBatchCapacity sets the batch capacity. Default is 0 (unbounded).
+func WithBatchCapacity[K comparable, V any](c int) Option[K, V] {
+	return func(l *Loader[K, V]) {
+		l.maxBatch = c
+	}
+}
+
+// WithWait sets the amount of time to wait before triggering a batch.
+// Default duration is 16 milliseconds.
+func WithWait[K comparable, V any](d time.Duration) Option[K, V] {
+	return func(l *Loader[K, V]) {
+		l.wait = d
+	}
+}
+
+// NewBatchLoader creates a new Loader given a fetch, wait, and maxBatch
+func NewBatchLoader[K comparable, V any](batchFn BatchFunc[K, V], opts ...Option[K, V]) *Loader[K, V] {
+	loader := &Loader[K, V]{
+		fetch:    batchFn,
+		wait:     16 * time.Millisecond,
+		maxBatch: 0,
 	}
 
-	ctx := config.Context
-	if ctx == nil {
-		ctx = context.Background()
+	// Apply options
+	for _, apply := range opts {
+		apply(loader)
 	}
 
-	return &Loader[K, V]{
-		fetch:    config.Fetch,
-		wait:     config.Wait,
-		maxBatch: config.MaxBatch,
-		cache:    cache,
-		ctx:      ctx,
+	// Set defaults
+	if loader.cache == nil {
+		loader.cache = NewInMemoryCache[K, V]()
 	}
+
+	return loader
 }
 
 // Thunk is a function that will block until the value (*Result) it contains is resolved.
@@ -57,7 +70,7 @@ type ThunkMany[V any] func() ([]V, []error)
 // Loader batches and caches requests
 type Loader[K comparable, V any] struct {
 	// this method provides the data for the loader
-	fetch func(keys []K) ([]V, []error)
+	fetch BatchFunc[K, V]
 
 	// how long to done before sending a batch
 	wait time.Duration
@@ -76,9 +89,6 @@ type Loader[K comparable, V any] struct {
 
 	// mutex to prevent races
 	mu sync.Mutex
-
-	// context to use for all requests
-	ctx context.Context
 }
 
 type loaderBatch[K comparable, V any] struct {
@@ -90,16 +100,16 @@ type loaderBatch[K comparable, V any] struct {
 }
 
 // Load a Value by key, batching and caching will be applied automatically
-func (l *Loader[K, V]) Load(key K) (V, error) {
-	return l.LoadThunk(key)()
+func (l *Loader[K, V]) Load(ctx context.Context, key K) (V, error) {
+	return l.LoadThunk(ctx, key)()
 }
 
 // LoadThunk returns a function that when called will block waiting for a Value.
 // This method should be used if you want one goroutine to make requests to many
 // different data loaders without blocking until the thunk is called.
-func (l *Loader[K, V]) LoadThunk(key K) Thunk[V] {
+func (l *Loader[K, V]) LoadThunk(ctx context.Context, key K) Thunk[V] {
 	l.mu.Lock()
-	if it, ok := l.cache.Get(l.ctx, key); ok {
+	if it, ok := l.cache.Get(ctx, key); ok {
 		l.mu.Unlock()
 		return func() (V, error) {
 			return *it, nil
@@ -109,7 +119,7 @@ func (l *Loader[K, V]) LoadThunk(key K) Thunk[V] {
 		l.batch = &loaderBatch[K, V]{done: make(chan struct{})}
 	}
 	batch := l.batch
-	pos := batch.keyIndex(l, key)
+	pos := batch.keyIndex(ctx, l, key)
 	l.mu.Unlock()
 
 	return func() (V, error) {
@@ -130,7 +140,7 @@ func (l *Loader[K, V]) LoadThunk(key K) Thunk[V] {
 
 		if err == nil {
 			l.mu.Lock()
-			l.unsafeSet(key, data)
+			l.unsafeSet(ctx, key, data)
 			l.mu.Unlock()
 		}
 
@@ -140,11 +150,11 @@ func (l *Loader[K, V]) LoadThunk(key K) Thunk[V] {
 
 // LoadAll fetches many keys at once. It will be broken into appropriate sized
 // sub batches depending on how the loader is configured
-func (l *Loader[K, V]) LoadAll(keys []K) ([]V, []error) {
+func (l *Loader[K, V]) LoadAll(ctx context.Context, keys []K) ([]V, []error) {
 	results := make([]func() (V, error), len(keys))
 
 	for i, key := range keys {
-		results[i] = l.LoadThunk(key)
+		results[i] = l.LoadThunk(ctx, key)
 	}
 
 	values := make([]V, len(keys))
@@ -158,10 +168,10 @@ func (l *Loader[K, V]) LoadAll(keys []K) ([]V, []error) {
 // LoadAllThunk returns a function that when called will block waiting for a Value.
 // This method should be used if you want one goroutine to make requests to many
 // different data loaders without blocking until the thunk is called.
-func (l *Loader[K, V]) LoadAllThunk(keys []K) ThunkMany[V] {
+func (l *Loader[K, V]) LoadAllThunk(ctx context.Context, keys []K) ThunkMany[V] {
 	results := make([]func() (V, error), len(keys))
 	for i, key := range keys {
-		results[i] = l.LoadThunk(key)
+		results[i] = l.LoadThunk(ctx, key)
 	}
 	return func() ([]V, []error) {
 		values := make([]V, len(keys))
@@ -176,37 +186,37 @@ func (l *Loader[K, V]) LoadAllThunk(keys []K) ThunkMany[V] {
 // Prime the cache with the provided key and value. If the key already exists, no change is made
 // and false is returned.
 // (To forcefully prime the cache, clear the key first with loader.clear(key).prime(key, value).)
-func (l *Loader[K, V]) Prime(key K, value V) bool {
+func (l *Loader[K, V]) Prime(ctx context.Context, key K, value V) bool {
 	l.mu.Lock()
 	var found bool
-	if _, found = l.cache.Get(l.ctx, key); !found {
-		l.unsafeSet(key, value)
+	if _, found = l.cache.Get(ctx, key); !found {
+		l.unsafeSet(ctx, key, value)
 	}
 	l.mu.Unlock()
 	return !found
 }
 
 // Clear the value at key from the cache, if it exists
-func (l *Loader[K, V]) Clear(key K) {
+func (l *Loader[K, V]) Clear(ctx context.Context, key K) {
 	l.mu.Lock()
-	l.cache.Delete(l.ctx, key)
+	l.cache.Delete(ctx, key)
 	l.mu.Unlock()
 }
 
 // ClearAll clears the entire cache
-func (l *Loader[K, V]) ClearAll() {
+func (l *Loader[K, V]) ClearAll(ctx context.Context) {
 	l.mu.Lock()
-	l.cache.Clear(l.ctx)
+	l.cache.Clear(ctx)
 	l.mu.Unlock()
 }
 
-func (l *Loader[K, V]) unsafeSet(key K, value V) {
-	l.cache.Set(l.ctx, key, value)
+func (l *Loader[K, V]) unsafeSet(ctx context.Context, key K, value V) {
+	l.cache.Set(ctx, key, value)
 }
 
 // keyIndex will return the location of the key in the batch, if it's not found
 // it will add the key to the batch
-func (b *loaderBatch[K, V]) keyIndex(l *Loader[K, V], key K) int {
+func (b *loaderBatch[K, V]) keyIndex(ctx context.Context, l *Loader[K, V], key K) int {
 	for i, existingKey := range b.keys {
 		if key == existingKey {
 			return i
@@ -216,21 +226,21 @@ func (b *loaderBatch[K, V]) keyIndex(l *Loader[K, V], key K) int {
 	pos := len(b.keys)
 	b.keys = append(b.keys, key)
 	if pos == 0 {
-		go b.startTimer(l)
+		go b.startTimer(ctx, l)
 	}
 
 	if l.maxBatch != 0 && pos >= l.maxBatch-1 {
 		if !b.closing {
 			b.closing = true
 			l.batch = nil
-			go b.end(l)
+			go b.end(ctx, l)
 		}
 	}
 
 	return pos
 }
 
-func (b *loaderBatch[K, V]) startTimer(l *Loader[K, V]) {
+func (b *loaderBatch[K, V]) startTimer(ctx context.Context, l *Loader[K, V]) {
 	time.Sleep(l.wait)
 	l.mu.Lock()
 
@@ -243,10 +253,10 @@ func (b *loaderBatch[K, V]) startTimer(l *Loader[K, V]) {
 	l.batch = nil
 	l.mu.Unlock()
 
-	b.end(l)
+	b.end(ctx, l)
 }
 
-func (b *loaderBatch[K, V]) end(l *Loader[K, V]) {
-	b.data, b.error = l.fetch(b.keys)
+func (b *loaderBatch[K, V]) end(ctx context.Context, l *Loader[K, V]) {
+	b.data, b.error = l.fetch(ctx, b.keys)
 	close(b.done)
 }
